@@ -8516,7 +8516,7 @@ Register CombinerHelper::simplifyMultipleUseDemandedBits(
 
   MachineInstr *DefMI = MRI.getVRegDef(R);
   assert(DefMI && "Expected a definition in generic SSA MIR");
-  if (!isa<GAnd>(DefMI) && !isa<GOr>(DefMI))
+  if (!isa<GLogicalBinOp>(DefMI))
     return Register();
 
   unsigned Opcode = DefMI->getOpcode();
@@ -8539,9 +8539,10 @@ Register CombinerHelper::simplifyMultipleUseDemandedBits(
         return Deeper;
       return X;
     }
-    bool BypassToC = Opcode == TargetOpcode::G_AND
-                         ? DemandedBits.isSubsetOf(~*C)
-                         : DemandedBits.isSubsetOf(*C);
+    bool BypassToC =
+        Opcode != TargetOpcode::G_XOR &&
+        (Opcode == TargetOpcode::G_AND ? DemandedBits.isSubsetOf(~*C)
+                                       : DemandedBits.isSubsetOf(*C));
     if (BypassToC)
       return CReg;
     return Register();
@@ -8644,6 +8645,57 @@ bool CombinerHelper::simplifyDemandedBitsImpl(MachineInstr &MI, unsigned OpNo,
 
   unsigned Opcode = DefMI->getOpcode();
   switch (Opcode) {
+  case TargetOpcode::G_TRUNC: {
+    unsigned SrcBW =
+        MRI.getType(DefMI->getOperand(1).getReg()).getScalarSizeInBits();
+    KnownBits SrcKnown(SrcBW);
+    bool Changed =
+        simplifyDemandedBitsImpl(*DefMI, /*OpNo=*/1, Demanded.zext(SrcBW),
+                                 SrcKnown, Depth + 1, DoRewrite);
+    if (Changed) {
+      DropPoisonFlags();
+      InvalidateDebugUses(Demanded);
+    }
+    Known = SrcKnown.trunc(BW);
+    return Changed;
+  }
+  case TargetOpcode::G_XOR: {
+    Register LHS = DefMI->getOperand(1).getReg();
+    Register RHS = DefMI->getOperand(2).getReg();
+    KnownBits LHSKnown = VT->getKnownBits(LHS);
+    KnownBits RHSKnown = VT->getKnownBits(RHS);
+    if (Demanded.isSubsetOf(RHSKnown.Zero)) {
+      Known = LHSKnown;
+      return Rewrite(LHS);
+    }
+    if (Demanded.isSubsetOf(LHSKnown.Zero)) {
+      Known = RHSKnown;
+      return Rewrite(RHS);
+    }
+    bool Changed = simplifyDemandedBitsImpl(*DefMI, /*OpNo=*/2, Demanded,
+                                            RHSKnown, Depth + 1, DoRewrite);
+    Changed |= simplifyDemandedBitsImpl(*DefMI, /*OpNo=*/1, Demanded, LHSKnown,
+                                        Depth + 1, DoRewrite);
+    if (Changed) {
+      DropPoisonFlags();
+      InvalidateDebugUses(Demanded);
+    }
+    Known = LHSKnown ^ RHSKnown;
+    return Changed;
+  }
+  case TargetOpcode::G_SELECT: {
+    KnownBits TrueKnown(BW), FalseKnown(BW);
+    bool Changed = simplifyDemandedBitsImpl(*DefMI, /*OpNo=*/3, Demanded,
+                                            FalseKnown, Depth + 1, DoRewrite);
+    Changed |= simplifyDemandedBitsImpl(*DefMI, /*OpNo=*/2, Demanded, TrueKnown,
+                                        Depth + 1, DoRewrite);
+    if (Changed) {
+      DropPoisonFlags();
+      InvalidateDebugUses(Demanded);
+    }
+    Known = TrueKnown.intersectWith(FalseKnown);
+    return Changed;
+  }
   case TargetOpcode::G_AND:
   case TargetOpcode::G_OR: {
     auto *Logic = cast<GLogicalBinOp>(DefMI);
@@ -8808,6 +8860,13 @@ bool CombinerHelper::matchSimplifyDemandedBits(MachineInstr &MI,
 
   unsigned Opcode = MI.getOpcode();
   switch (Opcode) {
+  case TargetOpcode::G_TRUNC: {
+    unsigned SrcBW =
+        MRI.getType(MI.getOperand(1).getReg()).getScalarSizeInBits();
+    APInt SrcDemand = RootDemand.zext(SrcBW);
+    KnownBits SrcKnown(SrcBW);
+    return Probe(/*OpNo=*/1, SrcDemand, SrcKnown);
+  }
   case TargetOpcode::G_SHL:
   case TargetOpcode::G_LSHR:
   case TargetOpcode::G_ASHR: {
